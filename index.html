@@ -282,15 +282,18 @@
       ⚙ 管理自選股
       <button class="manage-close" onclick="closeManage()">✕ 關閉</button>
     </div>
-    <div class="manage-section">目前追蹤的個股</div>
+    <div class="manage-section">目前追蹤個股</div>
     <div class="ticker-chips" id="ticker-chips"></div>
-    <div class="manage-section">新增個股</div>
-    <div class="add-row">
-      <input class="add-input" id="add-input" placeholder="輸入股票代碼 如 AAPL" maxlength="8" oninput="this.value=this.value.toUpperCase()">
-      <button class="add-btn" onclick="addTicker()">＋ 新增</button>
+    <div style="margin-top:12px;padding:10px 12px;background:rgba(88,166,255,0.08);border:1px solid rgba(88,166,255,0.3);border-radius:8px;">
+      <div style="font-size:12px;color:#58a6ff;font-weight:700;margin-bottom:6px">📊 透過 Google Sheet 管理個股</div>
+      <div style="font-size:11px;color:var(--muted);line-height:1.8;margin-bottom:10px">
+        在 Google Sheet 新增或刪除個股後，點「重新載入」同步。<br>
+        A欄 = 股票代碼　B欄 = 產業分類
+      </div>
+      <button class="save-btn" style="margin-top:0" onclick="window.open('https://docs.google.com/spreadsheets/d/1vq7-FhlkClwJIUMv81eNdagbB6MleUgMKbRLz_nM4Eo/edit','_blank')">📝 開啟 Google Sheet 編輯</button>
+      <button class="save-btn" style="margin-top:8px;background:#238636" onclick="reloadFromSheet()">🔄 重新載入個股清單</button>
     </div>
-    <div class="manage-note" id="manage-note">系統會自動判斷產業分類，新增後資料將自動載入。</div>
-    <button class="save-btn" onclick="saveAndApply()">✓ 儲存並套用</button>
+    <div class="manage-note" style="margin-top:10px">產業可填：AI晶片/GPU、網路/光通訊、記憶體/AI伺服器、傳統半導體/PC、AI雲端基礎設施、電動車、ETF指數基金</div>
   </div>
 </div>
 
@@ -304,6 +307,7 @@ const FH_KEY='d7opqc1r01qmthud4tf0d7opqc1r01qmthud4tfg';
 const TD_KEY='f936aa69be1b47619fa204257a89112e';
 const CACHE_KEY='mkt_v6';
 const TICKERS_KEY='user_tickers_v1';
+const SHEET_ID='1vq7-FhlkClwJIUMv81eNdagbB6MleUgMKbRLz_nM4Eo';
 
 // ── Sector auto-detect ──
 const SECTOR_MAP={
@@ -345,16 +349,44 @@ function isETF(t){ return ETF_LIST.includes(t); }
 const DEFAULT_TICKERS=['NVDA','AMD','MRVL','LITE','MU','SMCI','INTC','HPQ','CRWV','NBIS','TSLA','LCID','VOO','SCHG'];
 let userTickers=[...DEFAULT_TICKERS];
 
-function loadUserTickers(){
+async function loadUserTickers(){
+  // Try Google Sheet first
+  try{
+    const url=`https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv`;
+    const res=await fetch(url,{signal:AbortSignal.timeout(8000)});
+    if(res.ok){
+      const csv=await res.text();
+      const lines=csv.split('\n').map(l=>l.replace(/"/g,'').trim()).filter(l=>l);
+      const parsed=[];
+      const sectorMap={};
+      for(let i=1;i<lines.length;i++){
+        const [ticker,sector]=lines[i].split(',').map(s=>s.trim());
+        if(ticker&&ticker!=='ticker'){
+          parsed.push(ticker.toUpperCase());
+          if(sector) sectorMap[ticker.toUpperCase()]=sector;
+        }
+      }
+      if(parsed.length>0){
+        userTickers=parsed;
+        // Override SECTOR_MAP with sheet data
+        Object.assign(SECTOR_MAP, sectorMap);
+        console.log('Loaded from Google Sheet:', parsed);
+        return;
+      }
+    }
+  }catch(e){ console.warn('Sheet load failed:', e.message); }
+  
+  // Fallback to localStorage
   try{
     const s=localStorage.getItem(TICKERS_KEY);
     if(s){
       const parsed=JSON.parse(s);
-      if(parsed&&parsed.length>0) userTickers=parsed;
-      // else keep DEFAULT_TICKERS
+      if(parsed&&parsed.length>0){ userTickers=parsed; return; }
     }
-    // If nothing saved, userTickers stays as DEFAULT_TICKERS
-  }catch(e){ userTickers=[...DEFAULT_TICKERS]; }
+  }catch(e){}
+  
+  // Final fallback: default list
+  userTickers=[...DEFAULT_TICKERS];
 }
 function saveUserTickers(){
   try{ localStorage.setItem(TICKERS_KEY,JSON.stringify(userTickers)); }catch(e){}
@@ -825,6 +857,21 @@ async function addTicker(){
     document.getElementById('manage-note').textContent=`✅ 已新增 ${t}（${sec}），點「儲存並套用」確認。`;
   }catch(e){document.getElementById('manage-note').textContent=`驗證失敗，請稍後再試`;}
 }
+async function reloadFromSheet(){
+  closeManage();
+  clearCache();
+  dailyCache={date:todayNY(),data:{}};
+  setStatus('🔄 從 Google Sheet 重新載入...','info');
+  await loadUserTickers();
+  if(!userTickers||userTickers.length===0) userTickers=[...DEFAULT_TICKERS];
+  stopLive();
+  renderLayout();
+  await sleep(100);
+  await refreshQuotes();
+  startLive();
+  fetchAndCacheAll();
+}
+
 async function saveAndApply(){
   userTickers=[...pendingTickers];
   saveUserTickers();
@@ -937,9 +984,9 @@ function startLive(){if(liveTimer)clearInterval(liveTimer);liveTimer=setInterval
 function stopLive(){if(liveTimer){clearInterval(liveTimer);liveTimer=null;}}
 
 async function init(){
-  loadUserTickers();
-  // Safety check: if somehow empty, restore defaults
-  if(!userTickers||userTickers.length===0){ userTickers=[...DEFAULT_TICKERS]; saveUserTickers(); }
+  setStatus('📡 從 Google Sheet 載入個股清單...','loading');
+  await loadUserTickers();
+  if(!userTickers||userTickers.length===0){ userTickers=[...DEFAULT_TICKERS]; }
   renderLayout();
   const cached=loadCache();const today=todayNY();
   if(cached&&cached.date===today&&cached.data){

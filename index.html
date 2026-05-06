@@ -350,43 +350,63 @@ const DEFAULT_TICKERS=['NVDA','AMD','MRVL','LITE','MU','SMCI','INTC','HPQ','CRWV
 let userTickers=[...DEFAULT_TICKERS];
 
 async function loadUserTickers(){
-  // Try Google Sheet first
-  try{
-    const url=`https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv`;
-    const res=await fetch(url,{signal:AbortSignal.timeout(8000)});
-    if(res.ok){
-      const csv=await res.text();
-      const lines=csv.split('\n').map(l=>l.replace(/"/g,'').trim()).filter(l=>l);
-      const parsed=[];
-      const sectorMap={};
-      for(let i=1;i<lines.length;i++){
-        const [ticker,sector]=lines[i].split(',').map(s=>s.trim());
-        if(ticker&&ticker!=='ticker'){
-          parsed.push(ticker.toUpperCase());
-          if(sector) sectorMap[ticker.toUpperCase()]=sector;
+  // Try Google Sheet via multiple methods
+  const sheetId=SHEET_ID;
+  const urls=[
+    `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&sheet=Sheet1`,
+    `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv`,
+    `https://opensheet.elk.sh/${sheetId}/Sheet1`,
+  ];
+
+  for(const url of urls){
+    try{
+      const res=await fetch(url,{signal:AbortSignal.timeout(8000)});
+      if(!res.ok) continue;
+      const text=await res.text();
+      
+      let lines=[];
+      // opensheet returns JSON
+      if(url.includes('opensheet')){
+        const json=JSON.parse(text);
+        if(Array.isArray(json)&&json.length>0){
+          lines=json.map(row=>`${row.ticker||row.Ticker||Object.values(row)[0]},${row.sector||row.Sector||Object.values(row)[1]||''}`);
+        }
+      } else {
+        lines=text.split('\n').map(l=>l.replace(/"/g,'').trim()).filter(l=>l);
+        lines.shift(); // remove header row
+      }
+
+      const parsed=[], sectorMap={};
+      for(const line of lines){
+        const parts=line.split(',').map(s=>s.trim());
+        const ticker=parts[0]?.toUpperCase();
+        const sector=parts[1]||'其他';
+        if(ticker&&ticker.length>0&&ticker!=='TICKER'){
+          parsed.push(ticker);
+          sectorMap[ticker]=sector;
         }
       }
+
       if(parsed.length>0){
         userTickers=parsed;
-        // Override SECTOR_MAP with sheet data
-        Object.assign(SECTOR_MAP, sectorMap);
-        console.log('Loaded from Google Sheet:', parsed);
+        Object.assign(SECTOR_MAP,sectorMap);
+        console.log('✅ Loaded from Sheet via',url,':',parsed);
         return;
       }
+    }catch(e){
+      console.warn('Sheet URL failed:',url,e.message);
     }
-  }catch(e){ console.warn('Sheet load failed:', e.message); }
-  
-  // Fallback to localStorage
+  }
+
+  // Fallback: localStorage
   try{
     const s=localStorage.getItem(TICKERS_KEY);
-    if(s){
-      const parsed=JSON.parse(s);
-      if(parsed&&parsed.length>0){ userTickers=parsed; return; }
-    }
+    if(s){ const p=JSON.parse(s); if(p&&p.length>0){userTickers=p;return;} }
   }catch(e){}
-  
-  // Final fallback: default list
+
+  // Final fallback
   userTickers=[...DEFAULT_TICKERS];
+  console.warn('Using DEFAULT_TICKERS');
 }
 function saveUserTickers(){
   try{ localStorage.setItem(TICKERS_KEY,JSON.stringify(userTickers)); }catch(e){}
@@ -473,8 +493,10 @@ async function fetchQuote(ticker){
   if(!res.ok)throw new Error(`FH ${res.status}`);
   const d=await res.json();
   if(!d||d.c===0)throw new Error('no data');
-  const prev=stockData[ticker]?.vol||0;
-  const vol=(d.v&&d.v>0)?d.v:prev;
+  // d.v = accumulated intraday volume (valid during market hours)
+  // Keep last known volume if new value is 0 (pre-market / post-market)
+  const prevVol=stockData[ticker]?.vol||0;
+  const vol=(d.v!=null&&d.v>0)?d.v:prevVol;
   return{price:d.c,prev:d.pc,high:d.h,low:d.l,vol};
 }
 async function fetchFHMetrics(ticker){

@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -317,7 +316,7 @@ const SECTOR_MAP={
   'ASML':'AI晶片/GPU', 'TER':'AI晶片/GPU', 'ENTG':'AI晶片/GPU',
   'ON':'傳統半導體/PC', 'STM':'傳統半導體/PC', 'TXN':'傳統半導體/PC', 'ADI':'傳統半導體/PC',
   'MU':'記憶體/AI伺服器', 'SMCI':'記憶體/AI伺服器',
-  'PANW':'AI雲端基礎設施', 'CRM':'AI雲端基礎設施', 'NOW':'AI雲端基礎設施', 'VRT':'AI雲端基礎設施',
+  'PANW':'AI雲端基礎設施', 'CRM':'AI雲端基礎設施', 'NOW':'AI雲端基礎設施', 'VRT':'AI雲端基礎設施', 'AVGO':'網路/光通訊', 'COHR':'網路/光通訊', 'SNDK':'記憶體/AI伺服器',
   'NVDA':'AI晶片/GPU','AMD':'AI晶片/GPU','INTC':'傳統半導體/PC','QCOM':'傳統半導體/PC',
   'MRVL':'網路/光通訊','LITE':'網路/光通訊','CSCO':'網路/光通訊','ANET':'網路/光通訊',
   'MU':'記憶體/AI伺服器','SMCI':'記憶體/AI伺服器','WDC':'記憶體/AI伺服器',
@@ -490,14 +489,24 @@ function calcBB(cs,p=20){
 
 // ── API calls ──
 async function fetchQuote(ticker){
+  // Finnhub for price data
   const res=await fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FH_KEY}`,{signal:AbortSignal.timeout(6000)});
   if(!res.ok)throw new Error(`FH ${res.status}`);
   const d=await res.json();
   if(!d||d.c===0)throw new Error('no data');
-  // d.v = accumulated intraday volume (valid during market hours)
-  // Keep last known volume if new value is 0 (pre-market / post-market)
-  const prevVol=stockData[ticker]?.vol||0;
-  const vol=(d.v!=null&&d.v>0)?d.v:prevVol;
+
+  // Yahoo Finance for intraday volume (more reliable)
+  let vol=stockData[ticker]?.vol||0;
+  try{
+    const yhUrl=`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`;
+    const yh=await fetch(yhUrl,{signal:AbortSignal.timeout(5000)});
+    if(yh.ok){
+      const yd=await yh.json();
+      const yhVol=yd?.chart?.result?.[0]?.meta?.regularMarketVolume;
+      if(yhVol&&yhVol>0) vol=yhVol;
+    }
+  }catch(e){}
+
   return{price:d.c,prev:d.pc,high:d.h,low:d.l,vol};
 }
 async function fetchFHMetrics(ticker){
@@ -741,6 +750,120 @@ const NAMES={
 };
 function getTickerName(t){ return NAMES[t]||t; }
 
+
+// ── Best Decision Engine ──
+function calcDecision(d, cd){
+  if(!d) return null;
+  const price=d.price;
+  const {ma5,ma10,ma20,rsi,kd,macd,bb}=cd;
+  
+  const signals=[];
+  let bullCount=0, bearCount=0;
+
+  // MA signals
+  if(ma5){
+    if(price>ma5){ signals.push({icon:'🟢',text:`站上MA5（+${((price-ma5)/ma5*100).toFixed(1)}%）`}); bullCount++; }
+    else{ signals.push({icon:'🔴',text:`跌破MA5（${((price-ma5)/ma5*100).toFixed(1)}%）`}); bearCount+=2; }
+  }
+  if(ma10){
+    if(price>ma10){ bullCount++; }
+    else{ signals.push({icon:'🔴',text:`跌破MA10（${((price-ma10)/ma10*100).toFixed(1)}%）`}); bearCount+=2; }
+  }
+  if(ma20){
+    if(price>ma20){ bullCount++; }
+    else{ signals.push({icon:'🔴🔴',text:`跌破月線MA20（${((price-ma20)/ma20*100).toFixed(1)}%）`}); bearCount+=3; }
+  }
+
+  // KD signals
+  if(kd){
+    if(kd.signal==='golden'){ signals.push({icon:'🟢',text:'KD黃金交叉，短線買訊'}); bullCount+=2; }
+    else if(kd.signal==='death'){ signals.push({icon:'🔴',text:'KD死亡交叉，短線賣訊'}); bearCount+=2; }
+    if(kd.k>80){ signals.push({icon:'⚠️',text:`KD超買（K=${kd.k.toFixed(0)}），注意回調`}); bearCount++; }
+    else if(kd.k<20){ signals.push({icon:'💡',text:`KD超賣（K=${kd.k.toFixed(0)}），留意反彈`}); bullCount++; }
+  }
+
+  // MACD signals
+  if(macd){
+    if(macd.label==='turning_up'){ signals.push({icon:'🟢',text:'MACD柱狀轉正，動能轉強'}); bullCount+=2; }
+    else if(macd.label==='turning_down'){ signals.push({icon:'🔴',text:'MACD柱狀轉負，動能轉弱'}); bearCount+=2; }
+    else if(macd.label==='bullish'){ signals.push({icon:'🟢',text:'MACD多頭趨勢持續'}); bullCount++; }
+    else if(macd.label==='bearish'){ signals.push({icon:'🔴',text:'MACD空頭趨勢持續'}); bearCount++; }
+  }
+
+  // RSI signals
+  if(rsi){
+    if(rsi>75){ signals.push({icon:'⚠️',text:`RSI=${rsi.toFixed(0)}嚴重超買，追高風險高`}); bearCount++; }
+    else if(rsi<25){ signals.push({icon:'💡',text:`RSI=${rsi.toFixed(0)}嚴重超賣，可留意反彈`}); bullCount++; }
+  }
+
+  // BB signals
+  if(bb){
+    if(d.price>bb.upper){ signals.push({icon:'⚠️',text:'突破布林上軌，短期可能回調'}); bearCount++; }
+    else if(d.price<bb.lower){ signals.push({icon:'💡',text:'跌破布林下軌，超賣反彈機會'}); bullCount++; }
+    if(bb.bw<8){ signals.push({icon:'⚠️',text:`帶寬收窄（${bb.bw.toFixed(1)}%），即將大波動`}); }
+  }
+
+  // Stop loss reference
+  const stopRef=ma20?ma20:ma10?ma10:null;
+
+  // Overall verdict
+  let verdict='', verdictColor='', action='';
+  const score=bullCount-bearCount;
+
+  if(score>=4){
+    verdict='🟢🟢 強烈多頭訊號';
+    verdictColor='#3fb950';
+    action='可考慮進場，止損設 MA20';
+  } else if(score>=2){
+    verdict='🟢 短中線偏多';
+    verdictColor='#3fb950';
+    action='可持有或小量加碼，注意量能';
+  } else if(score>=0&&bullCount>0&&bearCount>0){
+    verdict='⚪ 訊號矛盾，建議觀望';
+    verdictColor='#8b949e';
+    action='等待訊號明朗後再進場';
+  } else if(score>=-2){
+    verdict='🔴 短線偏弱';
+    verdictColor='#f85149';
+    action='謹慎操作，可考慮減倉';
+  } else {
+    verdict='🔴🔴 中線轉空，建議回避';
+    verdictColor='#f85149';
+    action='建議觀望或停損出場';
+  }
+
+  return{verdict,verdictColor,action,signals,stopRef,score};
+}
+
+function toggleDecision(btn, ticker){
+  const box=document.getElementById(`decision-box-${ticker}`);
+  if(!box) return;
+  if(box.style.display!=='none'){
+    box.style.display='none';
+    btn.textContent='📊 最佳決策';
+    btn.style.background='#2d333b';
+    return;
+  }
+  const d=stockData[ticker];
+  const cd=dailyCache.data?.[ticker]||{};
+  const dec=calcDecision(d,cd);
+  if(!dec){ box.innerHTML='<span style="color:var(--muted)">資料載入中，請稍後...</span>'; box.style.display='block'; return; }
+
+  const stopText=dec.stopRef?`<div style="margin-top:6px;padding:5px 8px;background:rgba(248,81,73,0.1);border-radius:5px;color:#f85149">⚡ 止損參考：$${fmt(dec.stopRef)}（MA${dec.stopRef===cd.ma20?'20':dec.stopRef===cd.ma10?'10':'5'}）</div>`:'';
+
+  box.innerHTML=`
+    <div style="font-weight:700;font-size:13px;color:${dec.verdictColor};margin-bottom:6px">${dec.verdict}</div>
+    <div style="color:var(--muted);margin-bottom:8px;font-size:11px">💡 ${dec.action}</div>
+    <div style="border-top:1px solid var(--border);padding-top:8px">
+      ${dec.signals.map(s=>`<div style="margin-bottom:3px">${s.icon} ${s.text}</div>`).join('')}
+    </div>
+    ${stopText}
+  `;
+  box.style.display='block';
+  btn.textContent='📊 收起決策';
+  btn.style.background='#1f6feb';
+}
+
 let currentDetailTicker=null;
 function handleTip(el,tipKey){
   const d=stockData[currentDetailTicker];const cd=dailyCache.data?.[currentDetailTicker]||{};
@@ -784,8 +907,12 @@ function openDetail(ticker){
         <div class="d-price">$${fmt(d.price)}</div>
         <div class="d-change">${arrow} ${(change>=0?'+':'')+fmt(change)} (${(pct>=0?'+':'')+fmt(pct)}%)</div>
       </div>
-      <button class="tv-mini-btn" onclick="window.open('https://www.tradingview.com/chart/?symbol=${ticker}','_blank')">📈 即時圖表</button>
+      <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+        <button class="tv-mini-btn" onclick="window.open('https://www.tradingview.com/chart/?symbol=${ticker}','_blank')">📈 即時圖表</button>
+        <button class="tv-mini-btn" style="background:#2d333b;font-size:10px" onclick="toggleDecision(this,'${ticker}')">📊 最佳決策</button>
+      </div>
     </div>
+    <div id="decision-box-${ticker}" style="display:none;margin-top:8px;padding:10px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:8px;font-size:11px;line-height:1.8"></div>
     <div class="d-divider"></div>
     <div class="d-grid9">
       ${dgCell('HIGH','$'+fmt(d.high),'','dg-green','HIGH')}

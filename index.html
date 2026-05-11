@@ -298,14 +298,14 @@
 </div>
 
 <div class="footer">
-  即時報價：Finnhub（5秒更新）｜均線/RSI/KD/MACD/布林：Twelve Data + 自算（每日快取）<br>
+  即時報價：Finnhub（5秒更新）｜均線/指標：Twelve Data + 自算（每日快取）｜MACD(10,20,7)<br>
   點擊格子查看解讀說明｜點擊卡片查看詳情｜橘=破MA5 紅=破MA10 閃爍=破MA20
 </div>
 
 <script>
 const FH_KEY='d7opqc1r01qmthud4tf0d7opqc1r01qmthud4tfg';
 const TD_KEY='f936aa69be1b47619fa204257a89112e';
-const CACHE_KEY='mkt_v6';
+const CACHE_KEY='mkt_v7';
 const TICKERS_KEY='user_tickers_v1';
 const SHEET_ID='1vq7-FhlkClwJIUMv81eNdagbB6MleUgMKbRLz_nM4Eo';
 
@@ -458,14 +458,20 @@ function calcKD(hs,ls,cs,p=9){
   return{k,d,signal:sig};
 }
 function calcMACD(cs){
-  if(cs.length<28)return null;
-  const k12=2/13,k26=2/27,k9=2/10;
-  let e12=cs.slice(0,12).reduce((a,b)=>a+b,0)/12,e26=cs.slice(0,26).reduce((a,b)=>a+b,0)/26;
+  // Using 10/20/7 for faster signals on volatile tech stocks
+  if(cs.length<22)return null;
+  const k10=2/11,k20=2/21,k7=2/8;
+  let e10=cs.slice(0,10).reduce((a,b)=>a+b,0)/10;
+  let e20=cs.slice(0,20).reduce((a,b)=>a+b,0)/20;
   const diffs=[];
-  for(let i=1;i<cs.length;i++){e12=cs[i]*k12+e12*(1-k12);e26=cs[i]*k26+e26*(1-k26);if(i>=26)diffs.push(e12-e26);}
-  if(diffs.length<9)return null;
-  let sig=diffs.slice(0,9).reduce((a,b)=>a+b,0)/9;
-  for(let i=9;i<diffs.length;i++)sig=diffs[i]*k9+sig*(1-k9);
+  for(let i=1;i<cs.length;i++){
+    e10=cs[i]*k10+e10*(1-k10);
+    e20=cs[i]*k20+e20*(1-k20);
+    if(i>=20)diffs.push(e10-e20);
+  }
+  if(diffs.length<7)return null;
+  let sig=diffs.slice(0,7).reduce((a,b)=>a+b,0)/7;
+  for(let i=7;i<diffs.length;i++)sig=diffs[i]*k7+sig*(1-k7);
   const macd=diffs[diffs.length-1],hist=macd-sig;
   const ph=diffs.length>=2?diffs[diffs.length-2]-sig:null;
   let label='neutral';
@@ -489,25 +495,33 @@ function calcBB(cs,p=20){
 
 // ── API calls ──
 async function fetchQuote(ticker){
-  // Finnhub for price data
   const res=await fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FH_KEY}`,{signal:AbortSignal.timeout(6000)});
   if(!res.ok)throw new Error(`FH ${res.status}`);
   const d=await res.json();
   if(!d||d.c===0)throw new Error('no data');
-
-  // Yahoo Finance for intraday volume (more reliable)
-  let vol=stockData[ticker]?.vol||0;
-  try{
-    const yhUrl=`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`;
-    const yh=await fetch(yhUrl,{signal:AbortSignal.timeout(5000)});
-    if(yh.ok){
-      const yd=await yh.json();
-      const yhVol=yd?.chart?.result?.[0]?.meta?.regularMarketVolume;
-      if(yhVol&&yhVol>0) vol=yhVol;
-    }
-  }catch(e){}
-
+  // Use Finnhub volume - valid during market hours, keep prev if 0
+  const prevVol=stockData[ticker]?.vol||0;
+  const fhVol=(d.v&&d.v>0)?d.v:0;
+  // Use cached today vol from AV if Finnhub returns 0
+  const cachedVol=dailyCache.data?.[ticker]?.todayVol||0;
+  const vol=fhVol>0?fhVol:cachedVol>0?cachedVol:prevVol;
   return{price:d.c,prev:d.pc,high:d.h,low:d.l,vol};
+}
+
+// Fetch today's volume from Alpha Vantage (called once per day via daily cache)
+async function fetchTodayVol(ticker){
+  try{
+    const url=`https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${ticker}&outputsize=compact&apikey=${AV_KEY}`;
+    const res=await fetch(url,{signal:AbortSignal.timeout(12000)});
+    if(!res.ok)return 0;
+    const data=await res.json();
+    if(data['Note']||data['Information'])return 0;
+    const series=data['Time Series (Daily)'];
+    if(!series)return 0;
+    const dates=Object.keys(series).sort().reverse();
+    const latest=series[dates[0]];
+    return parseInt(latest['5. volume']||0);
+  }catch(e){return 0;}
 }
 async function fetchFHMetrics(ticker){
   const res=await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${ticker}&metric=all&token=${FH_KEY}`,{signal:AbortSignal.timeout(8000)});
@@ -554,7 +568,9 @@ async function fetchAndCacheAll(){
     const t=missing[i];
     setStatus(`📊 ${t} (${i+1}/${missing.length})... 每日只需一次`,'info');
     const data=await fetchWithRetry(t,3);
-    result[t]={...(result[t]||{}),...data};
+    // Fetch today's volume from AV (bundled into daily cache)
+    const todayVol=await fetchTodayVol(t);
+    result[t]={...(result[t]||{}),...data,todayVol};
     dailyCache={date:today,data:result};
     saveCache(today,result);
     updateCard(t);
@@ -568,7 +584,8 @@ async function fetchAndCacheAll(){
       const t=still[i];
       setStatus(`🔄 重試 ${t}...`,'info');
       const data=await fetchWithRetry(t,2);
-      result[t]={...(result[t]||{}),...data};
+      const todayVol2=await fetchTodayVol(t);
+      result[t]={...(result[t]||{}),...data,todayVol:todayVol2};
       dailyCache={date:today,data:result};
       saveCache(today,result);
       updateCard(t);
@@ -774,12 +791,34 @@ function calcDecision(d, cd){
     else{ signals.push({icon:'🔴🔴',text:`跌破月線MA20（${((price-ma20)/ma20*100).toFixed(1)}%）`}); bearCount+=3; }
   }
 
-  // KD signals
+  // KD signals - reduce weight in strong uptrend (price above MA20 + MACD bullish)
+  const strongUptrend=(ma20&&price>ma20)&&(macd&&(macd.label==='bullish'||macd.label==='turning_up'));
   if(kd){
-    if(kd.signal==='golden'){ signals.push({icon:'🟢',text:'KD黃金交叉，短線買訊'}); bullCount+=2; }
-    else if(kd.signal==='death'){ signals.push({icon:'🔴',text:'KD死亡交叉，短線賣訊'}); bearCount+=2; }
-    if(kd.k>80){ signals.push({icon:'⚠️',text:`KD超買（K=${kd.k.toFixed(0)}），注意回調`}); bearCount++; }
-    else if(kd.k<20){ signals.push({icon:'💡',text:`KD超賣（K=${kd.k.toFixed(0)}），留意反彈`}); bullCount++; }
+    if(kd.signal==='golden'){
+      signals.push({icon:'🟢',text:'KD黃金交叉，短線買訊'});
+      bullCount+=2;
+    } else if(kd.signal==='death'){
+      if(strongUptrend){
+        // In strong uptrend, KD death cross is less reliable
+        signals.push({icon:'⚠️',text:'KD死叉，但趨勢仍強，訊號參考性降低'});
+        bearCount+=1; // reduced from 2
+      } else {
+        signals.push({icon:'🔴',text:'KD死亡交叉，短線賣訊'});
+        bearCount+=2;
+      }
+    }
+    if(kd.k>80){
+      if(strongUptrend){
+        signals.push({icon:'⚠️',text:`KD超買（K=${kd.k.toFixed(0)}），強勢整理中，注意量縮`});
+        bearCount+=0; // no penalty in strong uptrend
+      } else {
+        signals.push({icon:'⚠️',text:`KD超買（K=${kd.k.toFixed(0)}），注意回調`});
+        bearCount++;
+      }
+    } else if(kd.k<20){
+      signals.push({icon:'💡',text:`KD超賣（K=${kd.k.toFixed(0)}），留意反彈`});
+      bullCount++;
+    }
   }
 
   // MACD signals
@@ -810,7 +849,18 @@ function calcDecision(d, cd){
   let verdict='', verdictColor='', action='';
   const score=bullCount-bearCount;
 
-  if(score>=4){
+  if(strongUptrend&&score>=0){
+    // Override for strong uptrend
+    if(score>=3){
+      verdict='🟢🟢 強勢多頭，趨勢向上';
+      verdictColor='#3fb950';
+      action='可持有，動態追蹤MA5為支撐';
+    } else {
+      verdict='🟢 趨勢偏多，短線整理中';
+      verdictColor='#3fb950';
+      action='持有為主，跌破MA10再評估減倉';
+    }
+  } else if(score>=4){
     verdict='🟢🟢 強烈多頭訊號';
     verdictColor='#3fb950';
     action='可考慮進場，止損設 MA20';
@@ -940,7 +990,7 @@ function openDetail(ticker){
       ${dgCell('D值',cd.kd?fmt(cd.kd.d,1):'--','','dg-gray','D值')}
       ${dgCell('KD訊號',cd.kd?(cd.kd.signal==='golden'?'🟢 黃金交叉':cd.kd.signal==='death'?'🔴 死亡交叉':cd.kd.signal==='above'?'🟢 K在D上方':'🔴 K在D下方'):'--',cd.kd&&cd.kd.k>80?'超買警示':cd.kd&&cd.kd.k<20?'超賣機會':'','dg-gray','KD訊號')}
     </div>
-    <div class="section-title">MACD（12,26,9）</div>
+    <div class="section-title">MACD（10,20,7）</div>
     <div class="d-grid9">
       ${dgCell('MACD',cd.macd?fmt(cd.macd.macd,3):'--','',cd.macd&&cd.macd.macd>0?'dg-green':'dg-red','MACD')}
       ${dgCell('SIGNAL',cd.macd?fmt(cd.macd.signal,3):'--','','dg-gray','SIGNAL')}
